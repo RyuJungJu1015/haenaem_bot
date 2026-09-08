@@ -8,7 +8,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- [ 설정 파트 ] ---
 TARGET_CHANNEL_NAME = "오늘도-해냄"
-TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.GXPRed.CK_vCwkO-ZbTYeKt0rrCAYqDYGL4GXUQIOa-no"  # 👈 여기에 직접 입력
+TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.GXPRed.CK_vCwkO-ZbTYeKt0rrCAYqDYGL4GXUQIOa-no"  # 👈 현재 직접 입력된 토큰
 # ----------------------
 
 intents = discord.Intents.default()
@@ -118,14 +118,21 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# --- Render 포트 바인딩용 더미 웹 서버 ---
-# bot.run()은 실행되면 멈추지 않는(blocking) 코드라서,
-# 반드시 bot.run()을 부르기 "전에" 더미 서버를 먼저 켜둬야 함
+# --- Render 포트 바인딩용 더미 웹 서버 (업타임로봇 대응 완료) ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is running!")
+
+    def do_HEAD(self):
+        # 업타임로봇이 핑을 쏠 때 거부하지 않고 200 OK로 정상 응답
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        # 불필요한 핑 로그가 터미널을 도배하는 것 방지
+        return
 
 def run_server():
     port = int(os.getenv("PORT", 10000))
