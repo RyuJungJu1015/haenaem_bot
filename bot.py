@@ -3,10 +3,12 @@ from discord.ext import commands
 import datetime
 import json
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # --- [ 설정 파트 ] ---
 TARGET_CHANNEL_NAME = "오늘도-해냄"
-TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.Glg3Yr.EPrNIfnn5FJUsAceXGZ4zdFN4RaoyI73LiOiMM"
+TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.GXPRed.CK_vCwkO-ZbTYeKt0rrCAYqDYGL4GXUQIOa-no"  # 👈 여기에 직접 입력
 # ----------------------
 
 intents = discord.Intents.default()
@@ -66,7 +68,7 @@ async def on_message(message):
 
         user_id = str(message.author.id)
         today = str(datetime.date.today())
-        
+
         data = load_data()
 
         if user_id not in data:
@@ -96,7 +98,7 @@ async def on_message(message):
         try:
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove)
-            
+
             if target_role and target_role not in member.roles:
                 await member.add_roles(target_role)
 
@@ -116,11 +118,9 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-bot.run(TOKEN)
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-
-# Render 포트 바인딩용 더미 웹 서버
+# --- Render 포트 바인딩용 더미 웹 서버 ---
+# bot.run()은 실행되면 멈추지 않는(blocking) 코드라서,
+# 반드시 bot.run()을 부르기 "전에" 더미 서버를 먼저 켜둬야 함
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -128,8 +128,12 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is running!")
 
 def run_server():
-    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHandler)
     server.serve_forever()
 
-# 백그라운드로 웹 서버 실행
+# 백그라운드로 웹 서버 먼저 실행
 threading.Thread(target=run_server, daemon=True).start()
+
+# --- 봇 실행 (반드시 파일 맨 마지막) ---
+bot.run(TOKEN)
