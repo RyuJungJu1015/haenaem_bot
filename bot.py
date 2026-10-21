@@ -1,11 +1,14 @@
-import discord
-from discord.ext import commands
+import asyncio
 import datetime
 import json
 import os
 import random
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import aiohttp
+import discord
+from discord.ext import commands
 
 # --- [ 설정 파트 ] ---
 TARGET_CHANNEL_NAME = "오늘도-해냄"
@@ -16,7 +19,23 @@ ALLOWED_EXTS = {
     "mp4", "mov", "webm", "m4v", "mkv", "avi",                   # 영상
 }  # 올릴 수 있는 파일 종류
 ALLOW_CAPTION = True  # 사진/영상과 함께 쓴 글(설명)을 허용할지. False로 바꾸면 글이 같이 있는 게시물도 삭제됨
+
+GIF_CHANCE = 1.0              # 칭찬에 GIF를 붙일 확률 (1.0 = 항상, 0.5 = 절반, 0 = 안 붙임). GIF 링크가 없는 캐릭터는 자동으로 안 붙음
+DELETE_AFTER_WITH_GIF = 15    # GIF가 붙은 칭찬 메시지가 사라지기까지의 시간(초)
+DELETE_AFTER_NO_GIF = 10      # GIF가 없는 칭찬 메시지가 사라지기까지의 시간(초)
 # ----------------------
+
+# Supabase 연결 정보는 코드에 쓰지 말고 Render의 환경변수(Environment)에만 넣으세요
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[: -len("/rest/v1")]
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+USE_DB = bool(SUPABASE_URL and SUPABASE_KEY)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHARACTERS_FILE = os.path.join(BASE_DIR, "characters.json")
+DATA_FILE = os.path.join(BASE_DIR, "attendance_data.json")          # Supabase를 못 쓸 때만 사용하는 임시 저장 파일
+CHAR_LOCAL_FILE = os.path.join(BASE_DIR, "user_characters.json")    # 위와 같은 이유
 
 # 한국 시간(KST, UTC+9). Render 서버는 UTC라서 직접 맞춰줘야 함
 KST = datetime.timezone(datetime.timedelta(hours=9))
@@ -27,62 +46,231 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-DATA_FILE = "attendance_data.json"
 
-# 인증 성공 시 랜덤으로 뽑아서 보내는 칭찬 문구 50개
-# {mention} = 인증한 사람 멘션, {count} = 누적 인증 횟수 (이 두 가지 외의 중괄호는 쓰면 안 됨)
-PRAISE_MESSAGES = [
-    "👏 {mention}님, 오늘도 해냈네요! 정말 멋져요!",
-    "🔥 {mention}님 오늘도 불태웠군요! 총 {count}회째, 대단해요!",
-    "🌟 {mention}님, 꾸준함이 빛나고 있어요. {count}번째 인증 축하해요!",
-    "💪 {mention}님이 또 해냈습니다! 오늘의 한 걸음, 멋졌어요!",
-    "🎉 인증 성공! {mention}님 덕분에 서버가 더 힘을 내요!",
-    "✨ {mention}님, 하루하루 쌓아 올린 노력이 정말 대단해요!",
-    "🏃 {mention}님, 오늘도 멈추지 않고 해냈어요. 박수 짝짝짝!",
-    "😆 오늘의 숙제 완료! {mention}님 최고예요!",
-    "🌱 {mention}님의 작은 노력이 쑥쑥 자라고 있어요. {count}회째 인증 완료!",
-    "🏅 {mention}님, 오늘도 금메달감이에요! 정말 잘했어요!",
-    "🚀 {mention}님, 한 걸음 더 도약했어요! {count}회째 인증 성공!",
-    "💯 오늘도 100점짜리 하루예요, {mention}님!",
-    "🎊 {mention}님, 해냈다! 오늘도 해냈다! 정말 고생 많았어요!",
-    "🥳 {mention}님 덕분에 오늘 채널이 더 반짝반짝해요!",
-    "🌈 {mention}님, 힘든 날에도 해낸 오늘이 더 값져요. 수고했어요!",
-    "👑 {mention}님은 오늘도 해냄의 주인공이에요! {count}회째 인증 성공!",
-    "🍀 꾸준히 해내는 {mention}님, 좋은 일이 가득할 거예요!",
-    "🙌 {mention}님, 오늘도 약속을 지켰네요. 정말 멋져요!",
-    "⭐ 별처럼 빛나는 하루였어요, {mention}님! 인증 완료!",
-    "🔔 딩동! {mention}님의 {count}번째 해냄이 도착했어요!",
-    "🎯 {mention}님, 오늘 목표도 명중이에요! 잘했어요!",
-    "🧗 {mention}님, 한 칸 한 칸 올라가고 있어요. 오늘도 수고했어요!",
-    "😎 {mention}님, 오늘도 해냈다니... 역시 믿고 있었어요!",
-    "🌞 {mention}님 덕분에 오늘 하루가 환해졌어요. 고생했어요!",
-    "💖 {mention}님, 오늘의 노력에 진심으로 박수를 보내요!",
-    "🥇 {mention}님, 어제의 나보다 한 걸음 더 나아갔어요! 멋져요!",
-    "🎈 {mention}님, 오늘도 해냈으니 마음껏 뿌듯해해도 돼요!",
-    "🌻 {mention}님의 꾸준함에 감탄이 나와요. 오늘도 잘했어요!",
-    "🐣 {mention}님, 하루하루 성장하는 모습이 정말 대단해요!",
-    "📈 {mention}님의 기록이 쑥쑥 올라가는 중이에요! 현재 {count}회, 굿굿!",
-    "🎶 랄랄라~ {mention}님이 또 해냈어요! 기분 좋은 소식이네요!",
-    "🍰 {mention}님, 오늘 고생한 만큼 달콤한 휴식도 챙기세요! 인증 완료!",
-    "🧡 {mention}님, 오늘도 포기하지 않아서 고마워요. 정말 잘했어요!",
-    "🛡️ {mention}님, 귀찮음을 이겨낸 오늘의 용사예요! 인증 성공!",
-    "🚩 {mention}님, 오늘도 목표 지점에 깃발을 꽂았어요! 축하해요!",
-    "🤩 와, {mention}님! 이 꾸준함 실화예요? 정말 대단해요!",
-    "🌙 {mention}님, 오늘 하루도 알차게 채웠네요. 잘했어요!",
-    "🥁 두구두구두구~ {mention}님의 인증, 합격입니다!",
-    "🧩 {mention}님, 오늘도 한 조각을 멋지게 맞췄어요! 큰 그림이 완성되고 있어요!",
-    "🍊 {mention}님의 상큼한 노력, 오늘도 잘 받았습니다! 짝짝짝!",
-    "🪄 {mention}님이 오늘도 마법처럼 해냈어요! 대단해요!",
-    "🦸 {mention}님, 오늘도 해냄 서버의 히어로예요! 멋져요!",
-    "🌊 {mention}님, 작은 물결이 모여 큰 파도가 되고 있어요. {count}회째 인증 성공!",
-    "🏆 {mention}님, 오늘도 트로피 하나 추가요! 수고했어요!",
-    "😊 {mention}님, 오늘도 스스로와의 약속을 지켰네요. 참 잘했어요!",
-    "🔥 {mention}님의 열정에 불이 붙었어요! 오늘도 활활 타올랐네요!",
-    "🎁 {mention}님, 오늘의 해냄은 내일의 나에게 주는 선물이에요! 잘했어요!",
-    "👏 {mention}님, 박수가 모자랄 정도예요! 오늘도 정말 고생했어요!",
-    "🌟 {mention}님의 {count}번째 별이 떴어요! 오늘도 반짝반짝 빛났어요!",
-    "💫 {mention}님, 오늘도 해냈다는 사실, 스스로 칭찬해 주세요! 정말 잘했어요!",
+# =====================================================================
+# 캐릭터 문구 불러오기 (characters.json)
+# =====================================================================
+FALLBACK_ACHIEVEMENT = "{mention}님, 인증 {count}회 달성하셨습니다! 🎉"
+FALLBACK_CHARACTERS = [{
+    "key": "default", "name": "기본", "description": "해냄이 기본 말투",
+    "messages": ["👏 {mention}님, 오늘도 해냈네요! 정말 멋져요!"], "gifs": [],
+}]
+
+
+def load_characters():
+    """characters.json을 읽어옵니다. 파일이 없거나 깨져 있어도 봇이 멈추지 않도록 기본 문구로 대체합니다."""
+    try:
+        with open(CHARACTERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        chars = data["characters"]
+        if not chars or not any(c["key"] == "default" for c in chars):
+            raise ValueError("기본(default) 캐릭터가 없어요")
+        for c in chars:
+            if not c.get("messages"):
+                raise ValueError(f"{c.get('name')} 캐릭터의 문구가 비어 있어요")
+        return data.get("achievement_message") or FALLBACK_ACHIEVEMENT, chars
+    except Exception as e:  # noqa
+        print(f"⚠️ characters.json을 읽지 못해서 기본 문구로 대체합니다: {e}")
+        return FALLBACK_ACHIEVEMENT, FALLBACK_CHARACTERS
+
+
+ACHIEVEMENT_MESSAGE, _CHAR_LIST = load_characters()
+CHARACTERS = {c["key"]: c for c in _CHAR_LIST}   # key -> 캐릭터 정보
+CHARACTER_ORDER = [c["key"] for c in _CHAR_LIST]  # 선택창에 보여줄 순서
+
+
+def pick_praise(selected_keys, mention, count):
+    """
+    사용자가 고른 캐릭터들 중 한 명을 먼저 뽑고(캐릭터별 같은 확률), 그 캐릭터의 문구 중 하나를 뽑습니다.
+    반환: (캐릭터 정보, 완성된 칭찬 문구)
+    """
+    keys = [k for k in selected_keys if k in CHARACTERS] or ["default"]
+    ch = CHARACTERS[random.choice(keys)]
+    text = random.choice(ch["messages"]).format(mention=mention, count=count)
+    return ch, text
+
+
+def pick_gif(ch):
+    gifs = ch.get("gifs") or []
+    if gifs and random.random() < GIF_CHANCE:
+        return random.choice(gifs)
+    return None
+
+
+# =====================================================================
+# 저장소 (Supabase). 환경변수가 없으면 임시로 로컬 파일을 씁니다 (재배포하면 초기화됨)
+# =====================================================================
+class DBError(Exception):
+    pass
+
+
+_session = None
+
+
+def get_session():
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    return _session
+
+
+def _headers(prefer=None):
+    h = {"apikey": SUPABASE_KEY, "Content-Type": "application/json"}
+    if SUPABASE_KEY.startswith("eyJ"):  # 예전 방식(JWT) 키는 Authorization 헤더도 필요
+        h["Authorization"] = f"Bearer {SUPABASE_KEY}"
+    if prefer:
+        h["Prefer"] = prefer
+    return h
+
+
+async def _request(method, table, params=None, body=None, prefer=None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    last_err = None
+    for attempt in range(2):  # 일시적인 네트워크 오류는 한 번 더 시도
+        try:
+            async with get_session().request(
+                method, url, params=params, json=body, headers=_headers(prefer)
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise DBError(f"Supabase 오류 {resp.status}: {text[:200]}")
+                return json.loads(text) if text else None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = e
+            await asyncio.sleep(0.5)
+    raise DBError(f"Supabase 연결 실패: {last_err!r}")
+
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _read_json(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _write_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+async def get_attendance(user_id):
+    """{'count': 누적 횟수, 'last_date': 마지막 인증 주기} 반환 (처음이면 0회)"""
+    if USE_DB:
+        rows = await _request("GET", "haenaem_attendance",
+                              params={"user_id": f"eq.{user_id}", "select": "count,last_date"})
+        if rows:
+            return {"count": int(rows[0]["count"]), "last_date": rows[0]["last_date"] or ""}
+        return {"count": 0, "last_date": ""}
+    rec = _read_json(DATA_FILE).get(user_id, {})
+    return {"count": int(rec.get("count", 0)), "last_date": rec.get("last_date", "")}
+
+
+async def save_attendance(user_id, count, last_date):
+    if USE_DB:
+        await _request("POST", "haenaem_attendance", params={"on_conflict": "user_id"},
+                       body=[{"user_id": user_id, "count": count, "last_date": last_date,
+                              "updated_at": _now_iso()}],
+                       prefer="resolution=merge-duplicates,return=minimal")
+        return
+    data = _read_json(DATA_FILE)
+    data[user_id] = {"count": count, "last_date": last_date}
+    _write_json(DATA_FILE, data)
+
+
+async def get_user_characters(user_id):
+    """사용자가 고른 캐릭터 key 목록. 고른 적 없으면 ['default'](기본)"""
+    keys = None
+    if USE_DB:
+        rows = await _request("GET", "haenaem_user_characters",
+                              params={"user_id": f"eq.{user_id}", "select": "characters"})
+        if rows:
+            keys = rows[0]["characters"]
+    else:
+        keys = _read_json(CHAR_LOCAL_FILE).get(user_id)
+    keys = [k for k in (keys or []) if k in CHARACTERS]
+    return keys or ["default"]
+
+
+async def set_user_characters(user_id, keys):
+    if USE_DB:
+        await _request("POST", "haenaem_user_characters", params={"on_conflict": "user_id"},
+                       body=[{"user_id": user_id, "characters": keys, "updated_at": _now_iso()}],
+                       prefer="resolution=merge-duplicates,return=minimal")
+        return
+    data = _read_json(CHAR_LOCAL_FILE)
+    data[user_id] = keys
+    _write_json(CHAR_LOCAL_FILE, data)
+
+
+async def check_db_and_import_legacy():
+    """
+    봇이 켜질 때 한 번 실행:
+    1) Supabase 연결과 표가 제대로 있는지 확인해서 문제가 있으면 로그에 알려줌
+    2) 인증 표가 비어 있고 예전 attendance_data.json이 있으면 기존 인증 횟수를 자동으로 옮겨 옴
+    """
+    if not USE_DB:
+        print("⚠️ [저장소] SUPABASE_URL / SUPABASE_KEY 환경변수가 없어서 임시 파일에 저장합니다. "
+              "(Render가 재배포되면 인증 횟수가 초기화돼요!)")
+        return
+    try:
+        rows = await _request("GET", "haenaem_attendance", params={"select": "user_id", "limit": "1"})
+        await _request("GET", "haenaem_user_characters", params={"select": "user_id", "limit": "1"})
+    except DBError as e:
+        print(f"❌ [저장소] Supabase 확인 실패: {e}")
+        print("   -> 주소(SUPABASE_URL), 키(SUPABASE_KEY), 표 만들기(supabase_setup.sql 실행)를 확인해 주세요.")
+        return
+    print("✅ [저장소] Supabase 연결 확인 완료")
+    if rows:
+        return
+    legacy = _read_json(DATA_FILE)
+    batch = [{"user_id": str(uid), "count": int(v.get("count", 0)), "last_date": str(v.get("last_date", ""))}
+             for uid, v in legacy.items() if isinstance(v, dict)]
+    if not batch:
+        return
+    try:
+        await _request("POST", "haenaem_attendance", params={"on_conflict": "user_id"}, body=batch,
+                       prefer="resolution=merge-duplicates,return=minimal")
+        print(f"✅ [저장소] 예전 attendance_data.json의 인증 기록 {len(batch)}명을 Supabase로 옮겼어요")
+    except DBError as e:
+        print(f"⚠️ [저장소] 예전 기록 옮기기 실패: {e}")
+
+
+_user_locks = {}
+
+
+def get_user_lock(user_id):
+    """같은 사람이 동시에 여러 장 올려도 횟수가 꼬이지 않도록 사람별로 줄 세우기"""
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
+
+
+# =====================================================================
+# 반응 이모티콘 / 역할 / 파일 검사 (기존 기능 그대로)
+# =====================================================================
+# 인증 성공 시 인증 사진에 랜덤으로 하나 달아주는 반응 이모티콘 50개
+REACTION_EMOJIS = [
+    "👏", "🎉", "🔥", "💪", "⭐", "🌟", "✨", "💯", "🏆", "🥇",
+    "🏅", "🎊", "🥳", "😆", "😎", "🤩", "😊", "💖", "🧡", "💙",
+    "💚", "💜", "🚀", "🎯", "👍", "🙌", "👑", "🌈", "🍀", "🌻",
+    "🌞", "🎈", "🎁", "🍰", "🥁", "🎶", "🔔", "🌱", "🐣", "📈",
+    "🧗", "🏃", "🦸", "🌊", "🪄", "🍊", "🧩", "🚩", "💫", "🥰",
 ]
+
+
+async def add_random_reaction(message):
+    """랜덤 이모티콘 반응을 추가. 혹시 실패하면 기본 👏로 한 번 더 시도하고, 그것도 안 되면 조용히 넘어감(칭찬 메시지는 계속 나감)"""
+    for emoji in (random.choice(REACTION_EMOJIS), "👏"):
+        try:
+            await message.add_reaction(emoji)
+            return
+        except discord.HTTPException:
+            continue
+
 
 # 이모티콘이 바뀌는 단계 (이 횟수에 도달하면 이모티콘 변경, 다음 단계 전까지는 그대로 유지)
 EMOJI_STAGES = [
@@ -97,6 +285,7 @@ EMOJI_STAGES = [
 ]
 MAX_LEVEL = 50  # 역할이 존재하는 최대 횟수 (0회 ~ 50회)
 
+
 def get_emoji(count):
     """현재 횟수에 해당하는 이모티콘 (직전 단계 이모티콘을 이어받음)"""
     for min_count, emoji in EMOJI_STAGES:
@@ -104,14 +293,17 @@ def get_emoji(count):
             return emoji
     return EMOJI_STAGES[-1][1]
 
+
 def get_role_name(count):
     """횟수 -> 역할 이름. 예) 3 -> '🐣 해냄 3회' / 50회 초과는 50회 역할 유지"""
     level = max(0, min(count, MAX_LEVEL))
     return f"{get_emoji(level)} 해냄 {level}회"
 
+
 # 0회 ~ 50회 전체 역할 이름 (51개)
 ROLE_NAMES_ORDERED = [get_role_name(i) for i in range(MAX_LEVEL + 1)]
 ALL_ROLE_NAMES = set(ROLE_NAMES_ORDERED)
+
 
 async def ensure_roles(guild):
     """서버에 없는 해냄 역할을 자동으로 생성 (50회 -> 0회 순서로 만들어 목록에서 위에서부터 0회가 보이게 함)"""
@@ -130,6 +322,7 @@ async def ensure_roles(guild):
             print(f"⚠️ [{guild.name}] '{name}' 생성 실패: {e}")
     print(f"✅ [{guild.name}] 역할 생성 완료")
 
+
 def is_allowed_attachment(att):
     """사진(이미지), GIF, 영상 파일만 허용. pdf/zip 같은 문서·기타 파일은 불허"""
     ext = att.filename.rsplit(".", 1)[-1].lower() if "." in att.filename else ""
@@ -138,6 +331,7 @@ def is_allowed_attachment(att):
     ctype = att.content_type or ""
     # 확장자만 .mp4로 바꾼 문서 파일 같은 우회 방지: 실제 파일 형식도 이미지/영상이어야 함
     return ctype == "" or ctype.startswith(("image/", "video/"))
+
 
 def get_cycle_date():
     """
@@ -149,26 +343,111 @@ def get_cycle_date():
     shifted = now_kst - datetime.timedelta(hours=RESET_HOUR)
     return str(shifted.date())
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+# =====================================================================
+# /캐릭터 명령어 (칭찬해 줄 캐릭터 고르기)
+# =====================================================================
+class CharacterSelect(discord.ui.Select):
+    def __init__(self, selected):
+        options = [
+            discord.SelectOption(
+                label=CHARACTERS[k]["name"],
+                value=k,
+                description=(CHARACTERS[k].get("description") or "")[:100] or None,
+                default=(k in selected),
+            )
+            for k in CHARACTER_ORDER
+        ]
+        super().__init__(
+            placeholder="칭찬해 줄 캐릭터를 골라주세요 (여러 명 가능)",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        keys = [k for k in CHARACTER_ORDER if k in self.values]
+        try:
+            await set_user_characters(str(interaction.user.id), keys)
+        except Exception as e:  # noqa
+            print(f"⚠️ 캐릭터 저장 실패: {e}")
+            await interaction.response.edit_message(
+                content="⚠️ 저장소에 잠깐 문제가 생겨서 저장하지 못했어요. 잠시 후 다시 시도해 주세요!", view=None)
+            return
+        names = ", ".join(CHARACTERS[k]["name"] for k in keys)
+        await interaction.response.edit_message(
+            content=f"✅ 저장했어요! 이제 인증하면 **{names}** 중에서 랜덤으로 칭찬해 드릴게요.", view=None)
+
+
+class CharacterView(discord.ui.View):
+    def __init__(self, selected):
+        super().__init__(timeout=180)
+        self.add_item(CharacterSelect(selected))
+
+
+@bot.tree.command(name="캐릭터", description="인증할 때 칭찬해 줄 캐릭터를 고릅니다")
+async def character_command(interaction: discord.Interaction):
+    # 저장소 응답이 느려도 3초 제한에 걸리지 않도록 먼저 '생각 중' 표시를 보냄
+    await interaction.response.defer(ephemeral=True)
+    try:
+        selected = await get_user_characters(str(interaction.user.id))
+    except Exception as e:  # noqa
+        print(f"⚠️ 캐릭터 불러오기 실패: {e}")
+        selected = ["default"]
+    names = ", ".join(CHARACTERS[k]["name"] for k in selected if k in CHARACTERS)
+    await interaction.followup.send(
+        f"지금 선택된 캐릭터: **{names}**\n아래에서 원하는 캐릭터를 모두 골라주세요. 고른 캐릭터들 중에서 랜덤으로 칭찬해 드려요!",
+        view=CharacterView(selected),
+        ephemeral=True,
+    )
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    print(f"⚠️ 명령어 오류: {error!r}")
+
+
+async def sync_commands_for_guild(guild):
+    """슬래시 명령어를 서버에 바로 등록 (서버 전용 등록은 즉시 반영됨)"""
+    try:
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"✅ [{guild.name}] /캐릭터 명령어 등록 완료")
+    except discord.Forbidden:
+        print(f"⚠️ [{guild.name}] 명령어 등록 권한이 없어요. 봇 초대 링크에 'applications.commands'를 체크해서 다시 초대해 주세요.")
+    except discord.HTTPException as e:
+        print(f"⚠️ [{guild.name}] 명령어 등록 실패: {e}")
+
+
+_ready_done = False
+
 
 @bot.event
 async def on_ready():
+    global _ready_done
     print(f"✅ 로그인 성공! 봇 이름: {bot.user.name}")
-    # 봇이 켜질 때마다 모든 서버에서 빠진 해냄 역할(0~50회)이 있는지 확인하고 만들어 둠
+    if _ready_done:  # 연결이 끊겼다 다시 붙을 때 중복 실행 방지
+        return
+    _ready_done = True
+    await check_db_and_import_legacy()
     for guild in bot.guilds:
+        # 봇이 켜질 때마다 모든 서버에서 빠진 해냄 역할(0~50회)이 있는지 확인하고 만들어 둠
         await ensure_roles(guild)
+        await sync_commands_for_guild(guild)
+
 
 @bot.event
+async def on_guild_join(guild):
+    await ensure_roles(guild)
+    await sync_commands_for_guild(guild)
+
+
+# =====================================================================
+# 인증 처리
+# =====================================================================
+@bot.event
 async def on_message(message):
-    if message.author.bot:
+    if message.author.bot or message.guild is None:
         return
 
     if message.channel.name == TARGET_CHANNEL_NAME:
@@ -193,23 +472,31 @@ async def on_message(message):
         user_id = str(message.author.id)
         cycle = get_cycle_date()  # 오후 3시 기준 주기
 
-        data = load_data()
+        try:
+            async with get_user_lock(user_id):
+                record = await get_attendance(user_id)
 
-        if user_id not in data:
-            data[user_id] = {"count": 0, "last_date": ""}
+                # 오후 3시 ~ 다음날 오후 3시 사이 1회 제한
+                if record["last_date"] == cycle:
+                    await message.delete()
+                    await message.channel.send(f"❌ {message.author.mention}님, 이번 인증은 이미 완료하셨습니다! 오후 3시 이후에 다시 도전해 주세요 🔥", delete_after=5)
+                    return
 
-        # 오후 3시 ~ 다음날 오후 3시 사이 1회 제한
-        if data[user_id]["last_date"] == cycle:
-            await message.delete()
-            await message.channel.send(f"❌ {message.author.mention}님, 이번 인증은 이미 완료하셨습니다! 오후 3시 이후에 다시 도전해 주세요 🔥", delete_after=5)
+                # 인증 성공 처리 (저장에 실패하면 횟수를 올리지 않고 아래 except로 이동)
+                new_count = record["count"] + 1
+                await save_attendance(user_id, new_count, cycle)
+        except DBError as e:
+            print(f"❌ 저장소 오류: {e}")
+            await message.channel.send(f"⚠️ {message.author.mention}님, 저장소에 잠깐 문제가 생겨서 인증을 기록하지 못했어요. 잠시 후 다시 올려주세요!", delete_after=10)
             return
 
-        # 인증 성공 처리
-        data[user_id]["count"] += 1
-        data[user_id]["last_date"] = cycle
-        save_data(data)
+        # 사용자가 고른 캐릭터 불러오기 (실패해도 기본 캐릭터로 칭찬은 계속 진행)
+        try:
+            selected = await get_user_characters(user_id)
+        except DBError as e:
+            print(f"⚠️ 캐릭터 설정을 불러오지 못해 기본으로 진행: {e}")
+            selected = ["default"]
 
-        new_count = data[user_id]["count"]
         target_role_name = get_role_name(new_count)
 
         guild = message.guild
@@ -219,8 +506,23 @@ async def on_message(message):
         roles_to_remove = [r for r in member.roles if r.name in ALL_ROLE_NAMES and r.name != target_role_name]
         target_role = discord.utils.get(guild.roles, name=target_role_name)
 
-        # 칭찬 문구 50개 중 랜덤으로 하나 뽑기
-        praise = random.choice(PRAISE_MESSAGES).format(mention=member.mention, count=new_count)
+        # 고른 캐릭터 중 한 명을 뽑고, 그 캐릭터의 문구 중 하나를 랜덤으로 뽑기
+        ch, praise = pick_praise(selected, member.mention, new_count)
+        achievement = ACHIEVEMENT_MESSAGE.format(mention=member.mention, count=new_count)  # 캐릭터와 상관없이 항상 같이 나가는 문구
+        gif_url = pick_gif(ch)
+        delete_after = DELETE_AFTER_WITH_GIF if gif_url else DELETE_AFTER_NO_GIF
+
+        async def send_praise(last_line):
+            text = f"**[{ch['name']}] {praise}**\n{achievement}\n{last_line}"
+            if gif_url:
+                try:
+                    embed = discord.Embed()
+                    embed.set_image(url=gif_url)
+                    await message.channel.send(text, embed=embed, delete_after=delete_after)
+                    return
+                except discord.HTTPException as e:
+                    print(f"⚠️ GIF를 붙이지 못해 글만 보냅니다 ({gif_url}): {e}")
+            await message.channel.send(text, delete_after=delete_after)
 
         try:
             # 혹시 역할이 아직 없다면 그 자리에서 바로 생성
@@ -233,21 +535,14 @@ async def on_message(message):
             if target_role and target_role not in member.roles:
                 await member.add_roles(target_role)
 
-            await message.add_reaction("👏")
-            await message.channel.send(
-                f"**{praise}**\n"
-                f"현재 역할: `{target_role_name}`",
-                delete_after=7
-            )
+            await add_random_reaction(message)
+            await send_praise(f"현재 역할: `{target_role_name}`")
         except discord.Forbidden:
-            await message.add_reaction("👏")
-            await message.channel.send(
-                f"**{praise}**\n"
-                f"⚠️ (봇의 역할 순위가 낮거나 권한이 부족하여 역할을 변경하지 못했습니다. 서버 설정에서 봇 역할을 다른 해냄 역할보다 상단으로 올려주세요!)",
-                delete_after=10
-            )
+            await add_random_reaction(message)
+            await send_praise("⚠️ (봇의 역할 순위가 낮거나 권한이 부족하여 역할을 변경하지 못했습니다. 서버 설정에서 봇 역할을 다른 해냄 역할보다 상단으로 올려주세요!)")
 
     await bot.process_commands(message)
+
 
 # --- Render 포트 바인딩용 더미 웹 서버 (업타임로봇 대응 완료) ---
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -265,13 +560,16 @@ class SimpleHandler(BaseHTTPRequestHandler):
         # 불필요한 핑 로그가 터미널을 도배하는 것 방지
         return
 
+
 def run_server():
     port = int(os.getenv("PORT", 10000))
     server = HTTPServer(('0.0.0.0', port), SimpleHandler)
     server.serve_forever()
 
-# 백그라운드로 웹 서버 먼저 실행
-threading.Thread(target=run_server, daemon=True).start()
 
-# --- 봇 실행 (반드시 파일 맨 마지막) ---
-bot.run(TOKEN)
+if __name__ == "__main__":
+    # 백그라운드로 웹 서버 먼저 실행
+    threading.Thread(target=run_server, daemon=True).start()
+
+    # --- 봇 실행 (반드시 파일 맨 마지막) ---
+    bot.run(TOKEN)
