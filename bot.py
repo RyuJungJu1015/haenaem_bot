@@ -14,7 +14,7 @@ from discord.ext import commands
 
 # --- [ 설정 파트 ] ---
 TARGET_CHANNEL_NAME = "오늘도-해냄"  # 인증을 받는 일반 텍스트 채널 이름
-FORUM_CHANNEL_NAMES = ["오늘도-해냄"]  # 인증을 받는 '포럼 채널' 이름들. 포럼 게시물 안에 올린 사진/영상도 인증으로 처리해요. 이름이 다르면 따옴표로 감싸서 바꾸거나 쉼표로 추가하세요. 예) ["인증-포럼", "오늘도-해냄"]
+FORUM_CHANNEL_NAMES = []  # (지금은 포럼을 안 써서 비워둠) 인증을 받는 '포럼 채널' 이름들. 포럼 게시물 안에 올린 사진/영상도 인증으로 처리해요. 이름이 다르면 따옴표로 감싸서 바꾸거나 쉼표로 추가하세요. 예) ["인증-포럼", "오늘도-해냄"]
 FORUM_DELETE_AFTER = None  # 포럼 게시물에 단 칭찬 댓글이 사라지기까지의 시간(초). None이면 지우지 않고 계속 남겨둠
 TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.GXPRed.CK_vCwkO-ZbTYeKt0rrCAYqDYGL4GXUQIOa-no"  # 👈 현재 직접 입력된 토큰
 RESET_HOUR = 15  # 인증 기준 시각: 매일 오후 3시(한국 시간)
