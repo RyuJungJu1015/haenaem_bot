@@ -3,7 +3,9 @@ import datetime
 import json
 import os
 import random
+import sys
 import threading
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import aiohttp
@@ -11,7 +13,9 @@ import discord
 from discord.ext import commands
 
 # --- [ 설정 파트 ] ---
-TARGET_CHANNEL_NAME = "오늘도-해냄"
+TARGET_CHANNEL_NAME = "오늘도-해냄"  # 인증을 받는 일반 텍스트 채널 이름
+FORUM_CHANNEL_NAMES = ["오늘도-해냄"]  # 인증을 받는 '포럼 채널' 이름들. 포럼 게시물 안에 올린 사진/영상도 인증으로 처리해요. 이름이 다르면 따옴표로 감싸서 바꾸거나 쉼표로 추가하세요. 예) ["인증-포럼", "오늘도-해냄"]
+FORUM_DELETE_AFTER = None  # 포럼 게시물에 단 칭찬 댓글이 사라지기까지의 시간(초). None이면 지우지 않고 계속 남겨둠
 TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.GXPRed.CK_vCwkO-ZbTYeKt0rrCAYqDYGL4GXUQIOa-no"  # 👈 현재 직접 입력된 토큰
 RESET_HOUR = 15  # 인증 기준 시각: 매일 오후 3시(한국 시간)
 ALLOWED_EXTS = {
@@ -445,28 +449,65 @@ async def on_guild_join(guild):
 # =====================================================================
 # 인증 처리
 # =====================================================================
+def get_channel_kind(channel):
+    """
+    인증을 받는 곳인지 구분
+    - "text"  : 인증 텍스트 채널 (TARGET_CHANNEL_NAME)
+    - "forum" : 인증 포럼 채널 안의 게시물 (FORUM_CHANNEL_NAMES)
+    - None    : 인증과 상관없는 곳
+    """
+    if isinstance(channel, discord.Thread):
+        parent = channel.parent
+        if isinstance(parent, discord.ForumChannel) and parent.name in FORUM_CHANNEL_NAMES:
+            return "forum"
+        return None
+    if getattr(channel, "name", None) == TARGET_CHANNEL_NAME:
+        return "text"
+    return None
+
+
+async def safe_send(channel, *args, **kwargs):
+    """메시지 보내기. 권한이 없어도 봇이 멈추지 않고 로그에만 남김"""
+    try:
+        return await channel.send(*args, **kwargs)
+    except discord.Forbidden:
+        print(f"⚠️ [{channel}] 메시지를 보낼 권한이 없어요. 포럼이라면 봇에게 '게시물에서 메시지 보내기' 권한을 주세요.")
+    except discord.HTTPException as e:
+        print(f"⚠️ 메시지 전송 실패: {e}")
+    return None
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is None:
         return
 
-    if message.channel.name == TARGET_CHANNEL_NAME:
+    kind = get_channel_kind(message.channel)
+    is_forum = kind == "forum"
+
+    async def reject(text):
+        """인증으로 인정할 수 없을 때: 텍스트 채널은 게시물을 지우고 안내, 포럼은 게시물은 두고 댓글로만 안내"""
+        if is_forum:
+            await safe_send(message.channel, text + " (이 게시물은 인증으로 기록되지 않았어요)", delete_after=15)
+        else:
+            await message.delete()
+            await message.channel.send(text, delete_after=5)
+
+    # 포럼 게시물 안의 '글만 있는 댓글'은 평범한 대화이므로 건드리지 않음
+    if kind == "text" or (is_forum and message.attachments):
         # 사진(첨부파일) 확인
         if not message.attachments:
-            await message.delete()
-            await message.channel.send(f"⚠️ {message.author.mention}님, 이 채널에는 인증 사진이나 영상을 함께 올려주셔야 합니다!", delete_after=5)
+            await reject(f"⚠️ {message.author.mention}님, 이 채널에는 인증 사진이나 영상을 함께 올려주셔야 합니다!")
             return
 
         # 사진/GIF/영상이 아닌 파일(문서, 압축파일 등)이 하나라도 있으면 차단 (인증 횟수에도 반영 안 됨)
         if not all(is_allowed_attachment(a) for a in message.attachments):
-            await message.delete()
-            await message.channel.send(f"⚠️ {message.author.mention}님, 사진, GIF, 영상 파일만 올릴 수 있어요! (문서나 압축파일 등은 올릴 수 없어요)", delete_after=5)
+            await reject(f"⚠️ {message.author.mention}님, 사진, GIF, 영상 파일만 올릴 수 있어요! (문서나 압축파일 등은 올릴 수 없어요)")
             return
 
         # 글이 같이 있는 게시물을 막고 싶을 때 (ALLOW_CAPTION = False)
         if not ALLOW_CAPTION and message.content.strip():
-            await message.delete()
-            await message.channel.send(f"⚠️ {message.author.mention}님, 이 채널에는 글 없이 사진이나 영상만 올려주세요!", delete_after=5)
+            await reject(f"⚠️ {message.author.mention}님, 이 채널에는 글 없이 사진이나 영상만 올려주세요!")
             return
 
         user_id = str(message.author.id)
@@ -478,8 +519,7 @@ async def on_message(message):
 
                 # 오후 3시 ~ 다음날 오후 3시 사이 1회 제한
                 if record["last_date"] == cycle:
-                    await message.delete()
-                    await message.channel.send(f"❌ {message.author.mention}님, 이번 인증은 이미 완료하셨습니다! 오후 3시 이후에 다시 도전해 주세요 🔥", delete_after=5)
+                    await reject(f"❌ {message.author.mention}님, 이번 인증은 이미 완료하셨습니다! 오후 3시 이후에 다시 도전해 주세요 🔥")
                     return
 
                 # 인증 성공 처리 (저장에 실패하면 횟수를 올리지 않고 아래 except로 이동)
@@ -487,7 +527,7 @@ async def on_message(message):
                 await save_attendance(user_id, new_count, cycle)
         except DBError as e:
             print(f"❌ 저장소 오류: {e}")
-            await message.channel.send(f"⚠️ {message.author.mention}님, 저장소에 잠깐 문제가 생겨서 인증을 기록하지 못했어요. 잠시 후 다시 올려주세요!", delete_after=10)
+            await safe_send(message.channel, f"⚠️ {message.author.mention}님, 저장소에 잠깐 문제가 생겨서 인증을 기록하지 못했어요. 잠시 후 다시 올려주세요!", delete_after=10)
             return
 
         # 사용자가 고른 캐릭터 불러오기 (실패해도 기본 캐릭터로 칭찬은 계속 진행)
@@ -510,7 +550,11 @@ async def on_message(message):
         ch, praise = pick_praise(selected, member.mention, new_count)
         achievement = ACHIEVEMENT_MESSAGE.format(mention=member.mention, count=new_count)  # 캐릭터와 상관없이 항상 같이 나가는 문구
         gif_url = pick_gif(ch)
-        delete_after = DELETE_AFTER_WITH_GIF if gif_url else DELETE_AFTER_NO_GIF
+        # 텍스트 채널은 일정 시간 뒤 칭찬 메시지를 지우고, 포럼은 댓글로 계속 남겨둠 (FORUM_DELETE_AFTER)
+        if is_forum:
+            delete_after = FORUM_DELETE_AFTER
+        else:
+            delete_after = DELETE_AFTER_WITH_GIF if gif_url else DELETE_AFTER_NO_GIF
 
         async def send_praise(last_line):
             text = f"**[{ch['name']}] {praise}**\n{achievement}\n{last_line}"
@@ -520,9 +564,12 @@ async def on_message(message):
                     embed.set_image(url=gif_url)
                     await message.channel.send(text, embed=embed, delete_after=delete_after)
                     return
+                except discord.Forbidden:
+                    print(f"⚠️ [{message.channel}] 메시지를 보낼 권한이 없어요. 포럼이라면 봇에게 '게시물에서 메시지 보내기' 권한을 주세요.")
+                    return
                 except discord.HTTPException as e:
                     print(f"⚠️ GIF를 붙이지 못해 글만 보냅니다 ({gif_url}): {e}")
-            await message.channel.send(text, delete_after=delete_after)
+            await safe_send(message.channel, text, delete_after=delete_after)
 
         try:
             # 혹시 역할이 아직 없다면 그 자리에서 바로 생성
@@ -567,9 +614,22 @@ def run_server():
     server.serve_forever()
 
 
+RETRY_WAIT_SECONDS = 900  # 디스코드 접속에 실패했을 때 다시 시도하기 전에 쉬는 시간(초). 15분
+
+
 if __name__ == "__main__":
     # 백그라운드로 웹 서버 먼저 실행
     threading.Thread(target=run_server, daemon=True).start()
 
     # --- 봇 실행 (반드시 파일 맨 마지막) ---
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except Exception as e:  # noqa
+        # 접속에 실패하면 바로 죽고 다시 켜지는 일을 반복하면 디스코드가 더 오래 막으므로, 쉬었다가 종료(= Render가 다시 켬)
+        # 쉬는 동안에도 위의 가짜 웹사이트는 계속 응답하므로 업타임로봇/Render는 정상으로 봄
+        status = getattr(e, "status", "-")
+        print(f"❌ 디스코드 접속에 실패했어요 (종류={type(e).__name__}, 상태={status}): {str(e)[:200]}")
+        print("   -> 흔한 원인: Render 공용 IP가 디스코드(Cloudflare)에 일시 차단됨(429), 또는 토큰 오류(401)")
+        print(f"⏳ {RETRY_WAIT_SECONDS}초 쉬었다가 다시 시작합니다")
+        time.sleep(RETRY_WAIT_SECONDS)
+        sys.exit(1)
