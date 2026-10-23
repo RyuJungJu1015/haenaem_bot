@@ -14,8 +14,14 @@ from discord.ext import commands
 
 # --- [ 설정 파트 ] ---
 TARGET_CHANNEL_NAME = "오늘도-해냄"  # 인증을 받는 일반 텍스트 채널 이름
-FORUM_CHANNEL_NAMES = []  # (지금은 포럼을 안 써서 비워둠) 인증을 받는 '포럼 채널' 이름들. 포럼 게시물 안에 올린 사진/영상도 인증으로 처리해요. 이름이 다르면 따옴표로 감싸서 바꾸거나 쉼표로 추가하세요. 예) ["인증-포럼", "오늘도-해냄"]
+FORUM_CHANNEL_NAMES = ["오늘도-해냄"]  # 인증을 받는 '포럼 채널' 이름들. 포럼 게시물에 사진/영상을 올리면 댓글로 칭찬해요. 이름이 다르면 따옴표로 감싸서 바꾸거나 쉼표로 추가하세요. 예) ["인증-포럼", "오늘도-해냄"]
 FORUM_DELETE_AFTER = None  # 포럼 게시물에 단 칭찬 댓글이 사라지기까지의 시간(초). None이면 지우지 않고 계속 남겨둠
+
+DAILY_LIMIT = 5  # 하루(오후 3시~다음날 오후 3시)에 인증으로 인정되는 최대 사진/영상 게시물 수. 모두 인증 횟수로 쌓임
+UNLIMITED_USER_IDS = [1048357326605779116]  # 하루 제한 없이 올릴 수 있는 사람의 디스코드 ID 목록(숫자). 예) [123456789012345678]. 서버의 .env에 UNLIMITED_USER_IDS=아이디 로 넣어도 돼요 (여러 명이면 쉼표로)
+MILESTONE_CHANNEL_NAME = "관리자-화이팅-입니당"  # 50회, 100회... 달성을 알려줄 관리자 채널 이름
+MILESTONE_EVERY = 50  # 몇 번 인증할 때마다 관리자 채널에 알릴지 (0이면 알리지 않음)
+MILESTONE_MESSAGE = "🎉 {mention}님이 {count}번 인증을 완료하였습니다! 격려해 주세요 👏"
 TOKEN = os.getenv("DISCORD_TOKEN", "")  # 봇 토큰은 코드에 쓰지 않고 서버의 환경변수(DISCORD_TOKEN)에만 넣어요
 if not TOKEN:
     raise SystemExit("❌ DISCORD_TOKEN 환경변수가 없어요. 서버 설정에 봇 토큰을 넣어주세요.")
@@ -48,9 +54,21 @@ KST = datetime.timezone(datetime.timedelta(hours=9))
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+def _load_unlimited_ids():
+    """코드의 목록 + 환경변수(UNLIMITED_USER_IDS)의 아이디를 합쳐서 숫자 집합으로 만듦"""
+    ids = set()
+    raw = list(UNLIMITED_USER_IDS) + os.getenv("UNLIMITED_USER_IDS", "").replace(" ", "").split(",")
+    for x in raw:
+        if str(x).strip().isdigit():
+            ids.add(int(str(x).strip()))
+    return ids
+
+
+UNLIMITED_IDS = _load_unlimited_ids()
 
 
 # =====================================================================
@@ -164,27 +182,44 @@ def _write_json(path, data):
 
 
 async def get_attendance(user_id):
-    """{'count': 누적 횟수, 'last_date': 마지막 인증 주기} 반환 (처음이면 0회)"""
+    """{'count': 누적 횟수, 'last_date': 마지막 인증 주기, 'today_count': 그 주기에 인증한 횟수} 반환 (처음이면 0회)"""
     if USE_DB:
         rows = await _request("GET", "haenaem_attendance",
-                              params={"user_id": f"eq.{user_id}", "select": "count,last_date"})
+                              params={"user_id": f"eq.{user_id}", "select": "count,last_date,today_count"})
         if rows:
-            return {"count": int(rows[0]["count"]), "last_date": rows[0]["last_date"] or ""}
-        return {"count": 0, "last_date": ""}
+            r = rows[0]
+            return {"count": int(r["count"]), "last_date": r["last_date"] or "",
+                    "today_count": int(r.get("today_count") or 0)}
+        return {"count": 0, "last_date": "", "today_count": 0}
     rec = _read_json(DATA_FILE).get(user_id, {})
-    return {"count": int(rec.get("count", 0)), "last_date": rec.get("last_date", "")}
+    return {"count": int(rec.get("count", 0)), "last_date": rec.get("last_date", ""),
+            "today_count": int(rec.get("today_count", 0))}
 
 
-async def save_attendance(user_id, count, last_date):
+async def save_attendance(user_id, count, last_date, today_count):
     if USE_DB:
         await _request("POST", "haenaem_attendance", params={"on_conflict": "user_id"},
                        body=[{"user_id": user_id, "count": count, "last_date": last_date,
-                              "updated_at": _now_iso()}],
+                              "today_count": today_count, "updated_at": _now_iso()}],
                        prefer="resolution=merge-duplicates,return=minimal")
         return
     data = _read_json(DATA_FILE)
-    data[user_id] = {"count": count, "last_date": last_date}
+    data[user_id] = {"count": count, "last_date": last_date, "today_count": today_count}
     _write_json(DATA_FILE, data)
+
+
+async def get_ranking(limit=10):
+    """누적 인증 횟수가 많은 순서로 [(user_id, count), ...] 반환 (0회는 제외)"""
+    if USE_DB:
+        rows = await _request("GET", "haenaem_attendance",
+                              params={"select": "user_id,count", "order": "count.desc", "limit": str(limit)})
+        pairs = [(str(r["user_id"]), int(r["count"])) for r in (rows or [])]
+    else:
+        data = _read_json(DATA_FILE)
+        pairs = [(str(uid), int(v.get("count", 0))) for uid, v in data.items() if isinstance(v, dict)]
+        pairs.sort(key=lambda p: p[1], reverse=True)
+        pairs = pairs[:limit]
+    return [p for p in pairs if p[1] > 0]
 
 
 async def get_user_characters(user_id):
@@ -233,7 +268,8 @@ async def check_db_and_import_legacy():
     if rows:
         return
     legacy = _read_json(DATA_FILE)
-    batch = [{"user_id": str(uid), "count": int(v.get("count", 0)), "last_date": str(v.get("last_date", ""))}
+    batch = [{"user_id": str(uid), "count": int(v.get("count", 0)), "last_date": str(v.get("last_date", "")),
+              "today_count": int(v.get("today_count", 0))}
              for uid, v in legacy.items() if isinstance(v, dict)]
     if not batch:
         return
@@ -256,7 +292,7 @@ def get_user_lock(user_id):
 
 
 # =====================================================================
-# 반응 이모티콘 / 역할 / 파일 검사 (기존 기능 그대로)
+# 반응 이모티콘 / 파일 검사
 # =====================================================================
 # 인증 성공 시 인증 사진에 랜덤으로 하나 달아주는 반응 이모티콘 50개
 REACTION_EMOJIS = [
@@ -276,57 +312,6 @@ async def add_random_reaction(message):
             return
         except discord.HTTPException:
             continue
-
-
-# 이모티콘이 바뀌는 단계 (이 횟수에 도달하면 이모티콘 변경, 다음 단계 전까지는 그대로 유지)
-EMOJI_STAGES = [
-    (50, "🏆"),
-    (35, "👑"),
-    (25, "💎"),
-    (15, "⭐"),
-    (10, "🔥"),
-    (5,  "🌿"),
-    (1,  "🐣"),
-    (0,  "🌱"),
-]
-MAX_LEVEL = 50  # 역할이 존재하는 최대 횟수 (0회 ~ 50회)
-
-
-def get_emoji(count):
-    """현재 횟수에 해당하는 이모티콘 (직전 단계 이모티콘을 이어받음)"""
-    for min_count, emoji in EMOJI_STAGES:
-        if count >= min_count:
-            return emoji
-    return EMOJI_STAGES[-1][1]
-
-
-def get_role_name(count):
-    """횟수 -> 역할 이름. 예) 3 -> '🐣 해냄 3회' / 50회 초과는 50회 역할 유지"""
-    level = max(0, min(count, MAX_LEVEL))
-    return f"{get_emoji(level)} 해냄 {level}회"
-
-
-# 0회 ~ 50회 전체 역할 이름 (51개)
-ROLE_NAMES_ORDERED = [get_role_name(i) for i in range(MAX_LEVEL + 1)]
-ALL_ROLE_NAMES = set(ROLE_NAMES_ORDERED)
-
-
-async def ensure_roles(guild):
-    """서버에 없는 해냄 역할을 자동으로 생성 (50회 -> 0회 순서로 만들어 목록에서 위에서부터 0회가 보이게 함)"""
-    existing = {r.name for r in guild.roles}
-    missing = [n for n in reversed(ROLE_NAMES_ORDERED) if n not in existing]
-    if not missing:
-        return
-    print(f"🔧 [{guild.name}] 없는 역할 {len(missing)}개 생성 시작")
-    for name in missing:
-        try:
-            await guild.create_role(name=name, reason="해냄이봇 역할 자동 생성")
-        except discord.Forbidden:
-            print(f"⚠️ [{guild.name}] 역할 생성 권한이 없습니다. 봇에게 '역할 관리' 권한을 주세요.")
-            return
-        except discord.HTTPException as e:
-            print(f"⚠️ [{guild.name}] '{name}' 생성 실패: {e}")
-    print(f"✅ [{guild.name}] 역할 생성 완료")
 
 
 def is_allowed_attachment(att):
@@ -413,12 +398,36 @@ async def on_app_command_error(interaction: discord.Interaction, error):
     print(f"⚠️ 명령어 오류: {error!r}")
 
 
+# =====================================================================
+# /랭킹 명령어 (인증을 가장 많이 한 사람 TOP 10)
+# =====================================================================
+@bot.tree.command(name="랭킹", description="인증을 가장 많이 한 사람 TOP 10을 보여줍니다")
+async def ranking_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        ranking = await get_ranking(10)
+    except Exception as e:  # noqa
+        print(f"⚠️ 랭킹 불러오기 실패: {e}")
+        await interaction.followup.send("⚠️ 저장소에 잠깐 문제가 생겨서 랭킹을 불러오지 못했어요. 잠시 후 다시 시도해 주세요!", ephemeral=True)
+        return
+    if not ranking:
+        await interaction.followup.send("아직 인증 기록이 없어요. 첫 인증의 주인공이 되어보세요! 🔥")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, count) in enumerate(ranking):
+        mark = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{mark} <@{uid}> — {count}회")
+    await interaction.followup.send("🏆 **해냄 랭킹 TOP 10**\n" + "\n".join(lines),
+                                    allowed_mentions=discord.AllowedMentions.none())
+
+
 async def sync_commands_for_guild(guild):
     """슬래시 명령어를 서버에 바로 등록 (서버 전용 등록은 즉시 반영됨)"""
     try:
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
-        print(f"✅ [{guild.name}] /캐릭터 명령어 등록 완료")
+        print(f"✅ [{guild.name}] /캐릭터, /랭킹 명령어 등록 완료")
     except discord.Forbidden:
         print(f"⚠️ [{guild.name}] 명령어 등록 권한이 없어요. 봇 초대 링크에 'applications.commands'를 체크해서 다시 초대해 주세요.")
     except discord.HTTPException as e:
@@ -436,30 +445,53 @@ async def on_ready():
         return
     _ready_done = True
     await check_db_and_import_legacy()
+    if UNLIMITED_IDS:
+        print(f"ℹ️ 하루 제한 없는 사용자 {len(UNLIMITED_IDS)}명 등록됨")
     for guild in bot.guilds:
-        # 봇이 켜질 때마다 모든 서버에서 빠진 해냄 역할(0~50회)이 있는지 확인하고 만들어 둠
-        await ensure_roles(guild)
         await sync_commands_for_guild(guild)
+        if MILESTONE_EVERY > 0 and discord.utils.get(guild.text_channels, name=MILESTONE_CHANNEL_NAME) is None:
+            print(f"⚠️ [{guild.name}] 관리자 알림 채널 '{MILESTONE_CHANNEL_NAME}'을 찾지 못했어요. "
+                  f"{MILESTONE_EVERY}회 달성 알림이 가지 않아요. 코드 위쪽 MILESTONE_CHANNEL_NAME을 확인해 주세요.")
 
 
 @bot.event
 async def on_guild_join(guild):
-    await ensure_roles(guild)
     await sync_commands_for_guild(guild)
 
 
 # =====================================================================
 # 인증 처리
 # =====================================================================
-def get_channel_kind(channel):
+THREAD_TYPES = (discord.ChannelType.public_thread, discord.ChannelType.private_thread,
+                discord.ChannelType.news_thread)
+
+
+async def get_thread_parent(thread):
+    """포럼 게시물(스레드)이 속한 부모 채널. 캐시에 없으면 디스코드에서 직접 가져옴"""
+    parent = thread.parent
+    if parent is None and getattr(thread, "parent_id", None):
+        try:
+            parent = await bot.fetch_channel(thread.parent_id)
+        except discord.HTTPException:
+            parent = None
+    return parent
+
+
+async def get_channel_kind(channel):
     """
     인증을 받는 곳인지 구분
     - "text"  : 인증 텍스트 채널 (TARGET_CHANNEL_NAME)
     - "forum" : 인증 포럼 채널 안의 게시물 (FORUM_CHANNEL_NAMES)
     - None    : 인증과 상관없는 곳
     """
+    # 막 만들어진 포럼 게시물은 아직 봇이 모르는 채널로 올 수 있어서 한 번 더 조회
+    if isinstance(channel, discord.PartialMessageable) and channel.type in THREAD_TYPES:
+        try:
+            channel = await bot.fetch_channel(channel.id)
+        except discord.HTTPException:
+            return None
     if isinstance(channel, discord.Thread):
-        parent = channel.parent
+        parent = await get_thread_parent(channel)
         if isinstance(parent, discord.ForumChannel) and parent.name in FORUM_CHANNEL_NAMES:
             return "forum"
         return None
@@ -479,24 +511,41 @@ async def safe_send(channel, *args, **kwargs):
     return None
 
 
+async def notify_milestone(guild, member, count):
+    """50회, 100회... 단위로 달성하면 관리자 채널에 알림 (알림이 실패해도 인증은 그대로 진행)"""
+    if MILESTONE_EVERY <= 0 or count % MILESTONE_EVERY != 0:
+        return
+    channel = discord.utils.get(guild.text_channels, name=MILESTONE_CHANNEL_NAME)
+    if channel is None:
+        print(f"⚠️ 관리자 알림 채널 '{MILESTONE_CHANNEL_NAME}'을 찾지 못해 {count}회 달성 알림을 보내지 못했어요")
+        return
+    await safe_send(channel, MILESTONE_MESSAGE.format(mention=member.mention, count=count),
+                    allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.event
 async def on_message(message):
     if message.author.bot or message.guild is None:
         return
 
-    kind = get_channel_kind(message.channel)
+    kind = await get_channel_kind(message.channel)
     is_forum = kind == "forum"
+    # 포럼 게시물의 첫 글(게시물 본문)은 글 번호가 게시물 번호와 같음
+    is_starter = is_forum and getattr(message.channel, "id", None) == message.id
 
-    async def reject(text):
+    async def reject(text, delete_after=5):
         """인증으로 인정할 수 없을 때: 텍스트 채널은 게시물을 지우고 안내, 포럼은 게시물은 두고 댓글로만 안내"""
         if is_forum:
             await safe_send(message.channel, text + " (이 게시물은 인증으로 기록되지 않았어요)", delete_after=15)
         else:
-            await message.delete()
-            await message.channel.send(text, delete_after=5)
+            try:
+                await message.delete()
+            except discord.HTTPException as e:
+                print(f"⚠️ 게시물을 지우지 못했어요(봇에게 '메시지 관리' 권한이 필요해요): {e}")
+            await safe_send(message.channel, text, delete_after=delete_after)
 
-    # 포럼 게시물 안의 '글만 있는 댓글'은 평범한 대화이므로 건드리지 않음
-    if kind == "text" or (is_forum and message.attachments):
+    # 포럼 게시물 안의 '글만 있는 댓글'은 평범한 대화이므로 건드리지 않음 (게시물 본문은 사진이 꼭 필요)
+    if kind == "text" or (is_forum and (message.attachments or is_starter)):
         # 사진(첨부파일) 확인
         if not message.attachments:
             await reject(f"⚠️ {message.author.mention}님, 이 채널에는 인증 사진이나 영상을 함께 올려주셔야 합니다!")
@@ -514,19 +563,23 @@ async def on_message(message):
 
         user_id = str(message.author.id)
         cycle = get_cycle_date()  # 오후 3시 기준 주기
+        is_unlimited = message.author.id in UNLIMITED_IDS
 
         try:
             async with get_user_lock(user_id):
                 record = await get_attendance(user_id)
 
-                # 오후 3시 ~ 다음날 오후 3시 사이 1회 제한
-                if record["last_date"] == cycle:
-                    await reject(f"❌ {message.author.mention}님, 이번 인증은 이미 완료하셨습니다! 오후 3시 이후에 다시 도전해 주세요 🔥")
+                # 같은 주기(오후 3시~다음날 오후 3시)에서 지금까지 인증한 횟수 (새 주기면 0부터)
+                today = record["today_count"] if record["last_date"] == cycle else 0
+
+                if not is_unlimited and today >= DAILY_LIMIT:
+                    await reject(f"❌ {message.author.mention}님, 오늘은 {DAILY_LIMIT}번 모두 인증하셨습니다! 오후 3시 이후에 다시 도전해 주세요 🔥", delete_after=8)
                     return
 
                 # 인증 성공 처리 (저장에 실패하면 횟수를 올리지 않고 아래 except로 이동)
                 new_count = record["count"] + 1
-                await save_attendance(user_id, new_count, cycle)
+                new_today = today + 1
+                await save_attendance(user_id, new_count, cycle, new_today)
         except DBError as e:
             print(f"❌ 저장소 오류: {e}")
             await safe_send(message.channel, f"⚠️ {message.author.mention}님, 저장소에 잠깐 문제가 생겨서 인증을 기록하지 못했어요. 잠시 후 다시 올려주세요!", delete_after=10)
@@ -539,26 +592,23 @@ async def on_message(message):
             print(f"⚠️ 캐릭터 설정을 불러오지 못해 기본으로 진행: {e}")
             selected = ["default"]
 
-        target_role_name = get_role_name(new_count)
-
-        guild = message.guild
         member = message.author
-
-        # 기존 해냄 관련 역할 전부 제거 후 새로운 역할 부여
-        roles_to_remove = [r for r in member.roles if r.name in ALL_ROLE_NAMES and r.name != target_role_name]
-        target_role = discord.utils.get(guild.roles, name=target_role_name)
 
         # 고른 캐릭터 중 한 명을 뽑고, 그 캐릭터의 문구 중 하나를 랜덤으로 뽑기
         ch, praise = pick_praise(selected, member.mention, new_count)
         achievement = ACHIEVEMENT_MESSAGE.format(mention=member.mention, count=new_count)  # 캐릭터와 상관없이 항상 같이 나가는 문구
         gif_url = pick_gif(ch)
+        if is_unlimited:
+            last_line = f"오늘 인증 {new_today}회 (무제한)"
+        else:
+            last_line = f"오늘 인증 {new_today}/{DAILY_LIMIT}회"
         # 텍스트 채널은 일정 시간 뒤 칭찬 메시지를 지우고, 포럼은 댓글로 계속 남겨둠 (FORUM_DELETE_AFTER)
         if is_forum:
             delete_after = FORUM_DELETE_AFTER
         else:
             delete_after = DELETE_AFTER_WITH_GIF if gif_url else DELETE_AFTER_NO_GIF
 
-        async def send_praise(last_line):
+        async def send_praise():
             text = f"**[{ch['name']}] {praise}**\n{achievement}\n{last_line}"
             if gif_url:
                 try:
@@ -573,22 +623,9 @@ async def on_message(message):
                     print(f"⚠️ GIF를 붙이지 못해 글만 보냅니다 ({gif_url}): {e}")
             await safe_send(message.channel, text, delete_after=delete_after)
 
-        try:
-            # 혹시 역할이 아직 없다면 그 자리에서 바로 생성
-            if target_role is None:
-                target_role = await guild.create_role(name=target_role_name, reason="해냄이봇 역할 자동 생성")
-
-            if roles_to_remove:
-                await member.remove_roles(*roles_to_remove)
-
-            if target_role and target_role not in member.roles:
-                await member.add_roles(target_role)
-
-            await add_random_reaction(message)
-            await send_praise(f"현재 역할: `{target_role_name}`")
-        except discord.Forbidden:
-            await add_random_reaction(message)
-            await send_praise("⚠️ (봇의 역할 순위가 낮거나 권한이 부족하여 역할을 변경하지 못했습니다. 서버 설정에서 봇 역할을 다른 해냄 역할보다 상단으로 올려주세요!)")
+        await add_random_reaction(message)
+        await send_praise()
+        await notify_milestone(message.guild, member, new_count)
 
     await bot.process_commands(message)
 
