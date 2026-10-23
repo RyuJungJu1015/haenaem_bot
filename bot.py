@@ -16,7 +16,9 @@ from discord.ext import commands
 TARGET_CHANNEL_NAME = "오늘도-해냄"  # 인증을 받는 일반 텍스트 채널 이름
 FORUM_CHANNEL_NAMES = []  # (지금은 포럼을 안 써서 비워둠) 인증을 받는 '포럼 채널' 이름들. 포럼 게시물 안에 올린 사진/영상도 인증으로 처리해요. 이름이 다르면 따옴표로 감싸서 바꾸거나 쉼표로 추가하세요. 예) ["인증-포럼", "오늘도-해냄"]
 FORUM_DELETE_AFTER = None  # 포럼 게시물에 단 칭찬 댓글이 사라지기까지의 시간(초). None이면 지우지 않고 계속 남겨둠
-TOKEN = "MTU0MzQyOTQ5NDk3MzM5OTA0MA.GXPRed.CK_vCwkO-ZbTYeKt0rrCAYqDYGL4GXUQIOa-no"  # 👈 현재 직접 입력된 토큰
+TOKEN = os.getenv("DISCORD_TOKEN", "")  # 봇 토큰은 코드에 쓰지 않고 서버의 환경변수(DISCORD_TOKEN)에만 넣어요
+if not TOKEN:
+    raise SystemExit("❌ DISCORD_TOKEN 환경변수가 없어요. 서버 설정에 봇 토큰을 넣어주세요.")
 RESET_HOUR = 15  # 인증 기준 시각: 매일 오후 3시(한국 시간)
 ALLOWED_EXTS = {
     "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp",  # 사진 + GIF
